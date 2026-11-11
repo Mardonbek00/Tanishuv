@@ -1,41 +1,33 @@
-import asyncio
 import hashlib
 import html
+import json
 import logging
 import os
+import threading
+import time
+from contextlib import contextmanager
 
-import asyncpg
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiohttp import web
+import requests
+import telebot
+from flask import Flask, abort, request
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
+from telebot import types
+from telebot.apihelper import ApiTelegramException
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tanishuv")
 
 # ------------------------------------------------------------------ config
 TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render o'zi beradi
 PORT = int(os.getenv("PORT", "10000"))
 SECRET = os.getenv("WEBHOOK_SECRET") or hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
 MIN_AGE = 18
 MAX_AGE = 80
+MATCH_LOCK = 7001  # advisory lock kaliti
 
 REGIONS = [
     "Toshkent shahri", "Toshkent viloyati", "Andijon", "Buxoro", "Farg'ona",
@@ -50,13 +42,34 @@ B_PROFILE = "👤 Profil"
 B_NEXT = "⏭ Next"
 B_STOP = "⛔ Stop"
 B_CANCEL = "❌ Bekor qilish"
+B_ADMIN = "🛠 Admin panel"
 
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=B_SEARCH)], [KeyboardButton(text=B_TOPUP), KeyboardButton(text=B_PROFILE)]],
-    resize_keyboard=True,
-)
-chat_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=B_NEXT), KeyboardButton(text=B_STOP)]], resize_keyboard=True)
-cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=B_CANCEL)]], resize_keyboard=True)
+ALL_TYPES = [
+    "text", "photo", "video", "audio", "voice", "document", "sticker",
+    "animation", "video_note", "location", "contact", "venue", "poll", "dice",
+]
+
+
+def rkb(*rows):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for r in rows:
+        kb.row(*[types.KeyboardButton(t) for t in r])
+    return kb
+
+
+def ikb(rows, adjust=None):
+    """rows: [[(text, data), ...], ...]"""
+    kb = types.InlineKeyboardMarkup()
+    for r in rows:
+        kb.row(*[types.InlineKeyboardButton(t, callback_data=d) for t, d in r])
+    return kb
+
+
+main_kb = rkb([B_SEARCH], [B_TOPUP, B_PROFILE])
+admin_main_kb = rkb([B_SEARCH], [B_TOPUP, B_PROFILE], [B_ADMIN])
+chat_kb = rkb([B_NEXT, B_STOP])
+cancel_kb = rkb([B_CANCEL])
+BACK = [("⬅️ Admin menyu", "a:menu")]
 
 # ------------------------------------------------------------------ database
 SCHEMA = """
@@ -69,8 +82,14 @@ CREATE TABLE IF NOT EXISTS users(
     queue_at TIMESTAMPTZ,
     banned BOOLEAN NOT NULL DEFAULT false,
     registered BOOLEAN NOT NULL DEFAULT false,
+    state TEXT,
+    tmp TEXT,
+    photo TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS state TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tmp TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS photo TEXT;
 CREATE TABLE IF NOT EXISTS packages(
     id SERIAL PRIMARY KEY, coins INT NOT NULL, price INT NOT NULL
 );
@@ -88,677 +107,711 @@ INSERT INTO settings(key, value) VALUES
 ON CONFLICT (key) DO NOTHING;
 """
 
-pool: asyncpg.Pool = None  # type: ignore
+pool = ThreadedConnectionPool(1, 8, DATABASE_URL, sslmode=os.getenv("DB_SSLMODE", "require"))
 
 
-async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require", statement_cache_size=0)
-    async with pool.acquire() as c:
-        await c.execute(SCHEMA)
-        if await c.fetchval("SELECT count(*) FROM packages") == 0:
+@contextmanager
+def db():
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+def q(sql, *a):
+    with db() as cur:
+        cur.execute(sql, a)
+        return cur.fetchall()
+
+
+def q1(sql, *a):
+    with db() as cur:
+        cur.execute(sql, a)
+        return cur.fetchone()
+
+
+def qv(sql, *a):
+    r = q1(sql, *a)
+    return next(iter(r.values())) if r else None
+
+
+def ex(sql, *a):
+    with db() as cur:
+        cur.execute(sql, a)
+        return cur.rowcount
+
+
+def init_db():
+    with db() as cur:
+        cur.execute(SCHEMA)
+        cur.execute("SELECT count(*) AS n FROM packages")
+        if cur.fetchone()["n"] == 0:
             for coins, price in [(5, 5000), (10, 9000), (25, 20000), (50, 35000)]:
-                await c.execute("INSERT INTO packages(coins, price) VALUES($1, $2)", coins, price)
+                cur.execute("INSERT INTO packages(coins, price) VALUES(%s, %s)", (coins, price))
 
 
-async def q(sql, *a):
-    async with pool.acquire() as c:
-        return await c.fetch(sql, *a)
+def get_user(uid):
+    return q1("SELECT * FROM users WHERE id=%s", uid)
 
 
-async def q1(sql, *a):
-    async with pool.acquire() as c:
-        return await c.fetchrow(sql, *a)
+def get_setting(key):
+    return qv("SELECT value FROM settings WHERE key=%s", key) or ""
 
 
-async def qv(sql, *a):
-    async with pool.acquire() as c:
-        return await c.fetchval(sql, *a)
+def set_setting(key, value):
+    ex("INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", key, value)
 
 
-async def ex(sql, *a):
-    async with pool.acquire() as c:
-        return await c.execute(sql, *a)
+def set_state(uid, state, tmp=None):
+    if tmp is None:
+        ex("UPDATE users SET state=%s WHERE id=%s", state, uid)
+    else:
+        ex("UPDATE users SET state=%s, tmp=%s WHERE id=%s", state, json.dumps(tmp), uid)
 
 
-async def get_user(uid: int):
-    return await q1("SELECT * FROM users WHERE id=$1", uid)
+def money(n):
+    return f"{int(n):,}".replace(",", " ")
 
 
-async def get_setting(key: str) -> str:
-    return await qv("SELECT value FROM settings WHERE key=$1", key) or ""
-
-
-async def set_setting(key: str, value: str):
-    await ex(
-        "INSERT INTO settings(key, value) VALUES($1, $2) ON CONFLICT (key) DO UPDATE SET value=$2", key, value
-    )
-
-
-def money(n: int) -> str:
-    return f"{n:,}".replace(",", " ")
-
-
-def esc(s) -> str:
+def esc(s):
     return html.escape(str(s))
 
 
-def is_admin(uid: int) -> bool:
+def is_admin(uid):
     return uid in ADMIN_IDS
 
 
 # ------------------------------------------------------------------ bot
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-search_lock = asyncio.Lock()
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=False)
 
 
-class Reg(StatesGroup):
-    name = State()
-    age = State()
-    gender = State()
-    region = State()
-
-
-class Pay(StatesGroup):
-    screenshot = State()
-
-
-class Adm(StatesGroup):
-    card = State()
-    give = State()
-    ban = State()
-    broadcast = State()
-    pack = State()
-    start_coins = State()
-
-
-async def safe_send(uid: int, text: str, kb=None):
+def send(uid, text, kb=None):
+    if kb is main_kb and is_admin(uid):
+        kb = admin_main_kb  # adminlarga menyuda «Admin panel» tugmasi ham chiqadi
     try:
-        await bot.send_message(uid, text, reply_markup=kb)
+        bot.send_message(uid, text, reply_markup=kb)
         return True
-    except (TelegramForbiddenError, TelegramBadRequest):
+    except ApiTelegramException as e:
+        log.warning("send %s: %s", uid, e)
         return False
 
 
-@dp.message.outer_middleware()
-async def ban_guard(handler, event: Message, data):
-    if event.from_user and event.chat.type == "private" and not is_admin(event.from_user.id):
-        u = await get_user(event.from_user.id)
-        if u and u["banned"]:
-            await event.answer("🚫 Siz bloklangansiz.")
-            return
-    return await handler(event, data)
-
-
 # ------------------------------------------------------------------ registration
-@dp.message(CommandStart())
-async def start(m: Message, state: FSMContext):
-    await state.clear()
-    u = await get_user(m.from_user.id)
-    if u and u["registered"]:
+@bot.message_handler(commands=["start"], chat_types=["private"])
+def cmd_start(m):
+    uid = m.from_user.id
+    ex("INSERT INTO users(id) VALUES(%s) ON CONFLICT (id) DO NOTHING", uid)
+    u = get_user(uid)
+    if u["banned"] and not is_admin(uid):
+        return send(uid, "🚫 Siz bloklangansiz.")
+    if u["registered"]:
+        set_state(uid, None)
         if u["partner_id"]:
-            return await m.answer("Siz hozir suhbatdasiz.", reply_markup=chat_kb)
-        return await m.answer("Bosh menyu 👇", reply_markup=main_kb)
-    await m.answer(
+            return send(uid, "Siz hozir suhbatdasiz.", chat_kb)
+        return send(uid, "Bosh menyu 👇", main_kb)
+    set_state(uid, "name")
+    bot.send_message(
+        uid,
         "👋 Assalomu alaykum! Tanishuv botiga xush kelibsiz.\n\nAvval ro'yxatdan o'tamiz.\n<b>Ismingiz nima?</b>",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=types.ReplyKeyboardRemove(),
     )
-    await state.set_state(Reg.name)
 
 
-@dp.message(Reg.name, F.text)
-async def reg_name(m: Message, state: FSMContext):
-    name = m.text.strip()[:30]
+def state_name(u, text):
+    name = text[:30]
     if len(name) < 2:
-        return await m.answer("Ism kamida 2 ta belgidan iborat bo'lsin.")
-    await state.update_data(name=name)
-    await state.set_state(Reg.age)
-    await m.answer("<b>Yoshingiz nechada?</b> (raqam bilan)")
+        return send(u["id"], "Ism kamida 2 ta belgidan iborat bo'lsin.")
+    set_state(u["id"], "age", {"name": name})
+    send(u["id"], "<b>Yoshingiz nechada?</b> (raqam bilan)")
 
 
-@dp.message(Reg.age, F.text)
-async def reg_age(m: Message, state: FSMContext):
-    t = m.text.strip()
-    if not t.isdigit() or not (MIN_AGE <= int(t) <= MAX_AGE):
-        return await m.answer(f"Yoshni {MIN_AGE}–{MAX_AGE} oralig'ida raqam bilan kiriting.")
-    await state.update_data(age=int(t))
-    await state.set_state(Reg.gender)
-    kb = InlineKeyboardBuilder()
-    for k, v in GENDERS.items():
-        kb.button(text=v, callback_data=f"g:{k}")
-    await m.answer("<b>Jinsingiz?</b>", reply_markup=kb.as_markup())
+def state_age(u, text):
+    if not text.isdigit() or not (MIN_AGE <= int(text) <= MAX_AGE):
+        return send(u["id"], f"Yoshni {MIN_AGE}–{MAX_AGE} oralig'ida raqam bilan kiriting.")
+    tmp = json.loads(u["tmp"] or "{}")
+    tmp["age"] = int(text)
+    set_state(u["id"], "gender", tmp)
+    send(u["id"], "<b>Jinsingiz?</b>", ikb([[(v, f"g:{k}") for k, v in GENDERS.items()]]))
 
 
-@dp.callback_query(Reg.gender, F.data.startswith("g:"))
-async def reg_gender(c: CallbackQuery, state: FSMContext):
-    await state.update_data(gender=c.data[2:])
-    await state.set_state(Reg.region)
-    kb = InlineKeyboardBuilder()
+def region_kb(prefix="r"):
+    rows, row = [], []
     for i, r in enumerate(REGIONS):
-        kb.button(text=r, callback_data=f"r:{i}")
-    kb.adjust(2)
-    await c.message.edit_text("<b>Viloyatingizni tanlang:</b>", reply_markup=kb.as_markup())
-    await c.answer()
-
-
-@dp.callback_query(Reg.region, F.data.startswith("r:"))
-async def reg_region(c: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    region = REGIONS[int(c.data[2:])]
-    start_coins = int(await get_setting("start_coins") or 0)
-    await ex(
-        """INSERT INTO users(id, name, age, gender, region, coins, registered)
-           VALUES($1,$2,$3,$4,$5,$6,true)
-           ON CONFLICT (id) DO UPDATE SET name=$2, age=$3, gender=$4, region=$5, registered=true""",
-        c.from_user.id, d["name"], d["age"], d["gender"], region, start_coins,
-    )
-    await state.clear()
-    await c.message.delete()
-    await c.message.answer(
-        f"✅ Ro'yxatdan o'tdingiz!\n🎁 Sizga <b>{start_coins}</b> ta tanga sovg'a qilindi."
-        if start_coins
-        else "✅ Ro'yxatdan o'tdingiz!",
-        reply_markup=main_kb,
-    )
-    await c.answer()
+        row.append((r, f"{prefix}:{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ikb(rows)
 
 
 # ------------------------------------------------------------------ search / chat
-async def try_match(uid: int):
-    async with search_lock:
-        async with pool.acquire() as c:
-            async with c.transaction():
-                me = await c.fetchrow("SELECT * FROM users WHERE id=$1", uid)
-                if not me or me["partner_id"] or not me["searching"] or me["coins"] < 1:
-                    return None
-                p = await c.fetchrow(
-                    """SELECT * FROM users WHERE searching AND partner_id IS NULL AND id<>$1
-                       AND NOT banned AND coins>=1 ORDER BY queue_at LIMIT 1""",
-                    uid,
-                )
-                if not p:
-                    return None
-                await c.execute(
-                    """UPDATE users SET partner_id = CASE WHEN id=$1 THEN $2 ELSE $1 END,
-                       searching=false, coins=coins-1 WHERE id IN ($1,$2)""",
-                    uid, p["id"],
-                )
-                return p
+def try_match(uid):
+    with db() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (MATCH_LOCK,))
+        cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+        me = cur.fetchone()
+        if not me or me["partner_id"] or not me["searching"] or me["coins"] < 1:
+            return None
+        cur.execute(
+            """SELECT id FROM users WHERE searching AND partner_id IS NULL AND id<>%s
+               AND NOT banned AND coins>=1 ORDER BY queue_at LIMIT 1""",
+            (uid,),
+        )
+        p = cur.fetchone()
+        if not p:
+            return None
+        cur.execute(
+            """UPDATE users SET partner_id = CASE WHEN id=%s THEN %s ELSE %s END,
+               searching=false, coins=coins-1 WHERE id IN (%s,%s)""",
+            (uid, p["id"], uid, uid, p["id"]),
+        )
+        return p["id"]
 
 
-async def end_chat(uid: int):
-    async with pool.acquire() as c:
-        async with c.transaction():
-            r = await c.fetchrow("SELECT partner_id FROM users WHERE id=$1 FOR UPDATE", uid)
-            pid = r["partner_id"] if r else None
-            if pid:
-                await c.execute("UPDATE users SET partner_id=NULL WHERE id IN ($1,$2)", uid, pid)
-            return pid
+def end_chat(uid):
+    with db() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (MATCH_LOCK,))
+        cur.execute("SELECT partner_id FROM users WHERE id=%s", (uid,))
+        r = cur.fetchone()
+        pid = r["partner_id"] if r else None
+        if pid:
+            cur.execute("UPDATE users SET partner_id=NULL WHERE id IN (%s,%s)", (uid, pid))
+        return pid
 
 
-def partner_card(p) -> str:
-    return (
-        f"👤 {esc(p['name'])}, {p['age']} yosh\n"
-        f"{GENDERS.get(p['gender'], '')} • 📍 {esc(p['region'])}"
-    )
+def partner_card(p):
+    return f"👤 {esc(p['name'])}, {p['age']} yosh\n{GENDERS.get(p['gender'], '')} • 📍 {esc(p['region'])}"
 
 
-async def begin_search(m: Message):
-    uid = m.from_user.id
-    u = await get_user(uid)
-    if not u or not u["registered"]:
-        return await m.answer("Avval /start bosib ro'yxatdan o'ting.")
+def send_card(uid, person, text, kb=None):
+    """Rasmi bo'lsa rasm bilan, bo'lmasa oddiy matn. Yetkazilmasa False."""
+    if person["photo"]:
+        try:
+            bot.send_photo(uid, person["photo"], caption=text, reply_markup=kb)
+            return True
+        except ApiTelegramException as e:
+            if e.error_code == 403:
+                return False
+            log.warning("send_card photo %s: %s", uid, e)
+    return send(uid, text, kb)
+
+
+def announce(uid, pid):
+    me, p = get_user(uid), get_user(pid)
+    if not send_card(pid, me, f"✅ <b>Suhbatdosh topildi!</b>\n\n{partner_card(me)}\n\n💰 Qolgan tanga: {p['coins']}", chat_kb):
+        # sherik botni bloklagan: suhbatni bekor qilamiz, tangani qaytaramiz
+        end_chat(uid)
+        ex("UPDATE users SET coins=coins+1 WHERE id=%s", uid)
+        return send(uid, "⚠️ Suhbatdosh bilan bog'lanib bo'lmadi. Tangangiz qaytarildi, qayta urinib ko'ring.", main_kb)
+    send_card(uid, p, f"✅ <b>Suhbatdosh topildi!</b>\n\n{partner_card(p)}\n\n💰 Qolgan tanga: {me['coins']}", chat_kb)
+
+
+def do_search(u):
+    uid = u["id"]
     if u["partner_id"]:
-        return await m.answer("Siz allaqachon suhbatdasiz.", reply_markup=chat_kb)
+        return send(uid, "Siz allaqachon suhbatdasiz.", chat_kb)
     if u["coins"] < 1:
-        return await m.answer(
+        return send(
+            uid,
             "😔 Tangangiz yetarli emas. Qidirish uchun kamida 1 ta tanga kerak.\n"
             f"Balans: <b>{u['coins']}</b>. «{B_TOPUP}» tugmasini bosing.",
-            reply_markup=main_kb,
+            main_kb,
         )
-    await ex("UPDATE users SET searching=true, queue_at=now() WHERE id=$1", uid)
-    await m.answer("🔎 Suhbatdosh qidirilmoqda...", reply_markup=cancel_kb)
-    p = await try_match(uid)
-    if not p:
-        return
-    me = await get_user(uid)
-    p = await get_user(p["id"])
-    await m.answer(
-        f"✅ <b>Suhbatdosh topildi!</b>\n\n{partner_card(p)}\n\n💰 Qolgan tanga: {me['coins']}",
-        reply_markup=chat_kb,
-    )
-    await safe_send(
-        p["id"],
-        f"✅ <b>Suhbatdosh topildi!</b>\n\n{partner_card(me)}\n\n💰 Qolgan tanga: {p['coins']}",
-        chat_kb,
-    )
-
-
-@dp.message(F.text == B_SEARCH)
-async def search_btn(m: Message, state: FSMContext):
-    await state.clear()
-    await begin_search(m)
-
-
-@dp.message(F.text == B_CANCEL)
-async def cancel_btn(m: Message, state: FSMContext):
-    await state.clear()
-    await ex("UPDATE users SET searching=false WHERE id=$1", m.from_user.id)
-    await m.answer("Bekor qilindi.", reply_markup=main_kb)
-
-
-@dp.message(F.text == B_STOP)
-async def stop_btn(m: Message, state: FSMContext):
-    await state.clear()
-    pid = await end_chat(m.from_user.id)
-    if not pid:
-        return await m.answer("Siz suhbatda emassiz.", reply_markup=main_kb)
-    await m.answer("⛔ Suhbat tugatildi.", reply_markup=main_kb)
-    await safe_send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
-
-
-@dp.message(F.text == B_NEXT)
-async def next_btn(m: Message, state: FSMContext):
-    await state.clear()
-    pid = await end_chat(m.from_user.id)
+    ex("UPDATE users SET searching=true, queue_at=now() WHERE id=%s", uid)
+    send(uid, "🔎 Suhbatdosh qidirilmoqda...", cancel_kb)
+    pid = try_match(uid)
     if pid:
-        await safe_send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
-    await begin_search(m)
+        announce(uid, pid)
 
 
-@dp.message(F.text == B_PROFILE)
-async def profile_btn(m: Message, state: FSMContext):
-    await state.clear()
-    u = await get_user(m.from_user.id)
-    if not u or not u["registered"]:
-        return await m.answer("Avval /start bosing.")
-    await m.answer(
+def do_cancel(u):
+    ex("UPDATE users SET searching=false WHERE id=%s", u["id"])
+    send(u["id"], "Bekor qilindi.", main_kb)
+
+
+def do_stop(u):
+    pid = end_chat(u["id"])
+    if not pid:
+        return send(u["id"], "Siz suhbatda emassiz.", main_kb)
+    send(u["id"], "⛔ Suhbat tugatildi.", main_kb)
+    send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
+
+
+def do_next(u):
+    pid = end_chat(u["id"])
+    if pid:
+        send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
+    do_search(get_user(u["id"]))
+
+
+def do_profile(u):
+    rows = [
+        [("✏️ Ism", "e:name"), ("✏️ Yosh", "e:age")],
+        [("✏️ Jins", "e:gender"), ("✏️ Viloyat", "e:region")],
+        [("📸 Rasm yuklash" if not u["photo"] else "📸 Rasmni almashtirish", "e:photo")],
+    ]
+    if u["photo"]:
+        rows.append([("🗑 Rasmni o'chirish", "e:delphoto")])
+    text = (
         f"<b>👤 Profil</b>\n\nIsm: {esc(u['name'])}\nYosh: {u['age']}\n"
-        f"Jins: {GENDERS.get(u['gender'], '-')}\nViloyat: {esc(u['region'])}\n\n💰 Tanga: <b>{u['coins']}</b>",
-        reply_markup=main_kb,
+        f"Jins: {GENDERS.get(u['gender'], '-')}\nViloyat: {esc(u['region'])}\n\n💰 Tanga: <b>{u['coins']}</b>"
     )
+    send_card(u["id"], u, text, ikb(rows)) or send(u["id"], text, ikb(rows))
+
+
+def state_edit(m, u):
+    """Profilni tahrirlash va ro'yxatdan keyingi ixtiyoriy rasm bosqichi."""
+    uid, st = u["id"], u["state"]
+    text = (m.text or "").strip() if m.content_type == "text" else ""
+    if st == "edit:name":
+        if len(text) < 2:
+            return send(uid, "Ism kamida 2 ta belgidan iborat bo'lsin.")
+        ex("UPDATE users SET name=%s, state=NULL WHERE id=%s", text[:30], uid)
+    elif st == "edit:age":
+        if not text.isdigit() or not (MIN_AGE <= int(text) <= MAX_AGE):
+            return send(uid, f"Yoshni {MIN_AGE}–{MAX_AGE} oralig'ida raqam bilan kiriting.")
+        ex("UPDATE users SET age=%s, state=NULL WHERE id=%s", int(text), uid)
+    else:  # "photo" yoki "edit:photo"
+        if m.content_type != "photo":
+            return send(uid, "Iltimos, oddiy <b>rasm</b> yuboring (fayl emas).")
+        ex("UPDATE users SET photo=%s, state=NULL WHERE id=%s", m.photo[-1].file_id, uid)
+        if st == "photo":
+            return send(uid, "✅ Rasm saqlandi! Bosh menyu 👇", main_kb)
+    send(uid, "✅ Yangilandi.")
+    do_profile(get_user(uid))
+
+
+def relay(m, u):
+    try:
+        bot.copy_message(u["partner_id"], m.chat.id, m.message_id)
+    except ApiTelegramException as e:
+        if e.error_code == 403:
+            end_chat(u["id"])
+            send(u["id"], "⚠️ Suhbatdosh botni tark etgan. Suhbat tugatildi.", main_kb)
+        else:
+            send(u["id"], "Bu xabarni yuborib bo'lmadi.")
 
 
 # ------------------------------------------------------------------ top-up
-@dp.message(F.text == B_TOPUP)
-async def topup_btn(m: Message, state: FSMContext):
-    await state.clear()
-    u = await get_user(m.from_user.id)
-    if not u or not u["registered"]:
-        return await m.answer("Avval /start bosing.")
-    packs = await q("SELECT * FROM packages ORDER BY coins")
+def do_topup(u):
+    packs = q("SELECT * FROM packages ORDER BY coins")
     if not packs:
-        return await m.answer("Hozircha paketlar mavjud emas.")
-    kb = InlineKeyboardBuilder()
-    for p in packs:
-        kb.button(text=f"💰 {p['coins']} tanga — {money(p['price'])} so'm", callback_data=f"pk:{p['id']}")
-    kb.adjust(1)
-    await m.answer(f"Balans: <b>{u['coins']}</b> tanga\n\nPaketni tanlang:", reply_markup=kb.as_markup())
+        return send(u["id"], "Hozircha paketlar mavjud emas.", main_kb)
+    kb = ikb([[(f"💰 {p['coins']} tanga — {money(p['price'])} so'm", f"pk:{p['id']}")] for p in packs])
+    send(u["id"], f"Balans: <b>{u['coins']}</b> tanga\n\nPaketni tanlang:", kb)
 
 
-@dp.callback_query(F.data.startswith("pk:"))
-async def pick_pack(c: CallbackQuery, state: FSMContext):
-    p = await q1("SELECT * FROM packages WHERE id=$1", int(c.data[3:]))
-    if not p:
-        return await c.answer("Paket topilmadi", show_alert=True)
-    card, owner = await get_setting("card_number"), await get_setting("card_owner")
-    await state.set_state(Pay.screenshot)
-    await state.update_data(pack_id=p["id"])
-    await c.message.answer(
-        f"💳 <b>To'lov ma'lumotlari</b>\n\nPaket: <b>{p['coins']} tanga</b>\n"
-        f"Summa: <b>{money(p['price'])} so'm</b>\n\nKarta: <code>{esc(card)}</code>\nEgasi: {esc(owner)}\n\n"
-        "To'lovni amalga oshirib, <b>chek skrinshotini</b> shu yerga rasm qilib yuboring.",
-        reply_markup=cancel_kb,
-    )
-    await c.answer()
+def pay_kb(pid):
+    return ikb([[("✅ Tasdiqlash", f"py:ok:{pid}"), ("❌ Rad etish", f"py:no:{pid}")]])
 
 
-def pay_kb(pid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"py:ok:{pid}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"py:no:{pid}"),
-            ]
-        ]
-    )
-
-
-def pay_caption(p, u) -> str:
+def pay_caption(p, u):
     return (
-        f"💳 <b>To'lov #{p['id']}</b>\n👤 {esc(u['name'] if u else '?')} (<code>{p['user_id']}</code>)\n"
+        f"💳 <b>To'lov #{p['id']}</b>\n👤 {esc(u['name'] if u and u['name'] else '?')} (<code>{p['user_id']}</code>)\n"
         f"📦 {p['coins']} tanga — {money(p['price'])} so'm"
     )
 
 
-@dp.message(Pay.screenshot, F.photo | F.document)
-async def pay_screenshot(m: Message, state: FSMContext):
-    d = await state.get_data()
-    pack = await q1("SELECT * FROM packages WHERE id=$1", d.get("pack_id"))
+def send_payment_to(aid, p, u):
+    try:
+        bot.send_photo(aid, p["file_id"], caption=pay_caption(p, u), reply_markup=pay_kb(p["id"]))
+    except ApiTelegramException:
+        bot.send_document(aid, p["file_id"], caption=pay_caption(p, u), reply_markup=pay_kb(p["id"]))
+
+
+def state_pay(m, u):
+    uid = u["id"]
+    if m.content_type not in ("photo", "document"):
+        return send(uid, "Iltimos, chek skrinshotini <b>rasm</b> qilib yuboring yoki «❌ Bekor qilish» ni bosing.")
+    pack = q1("SELECT * FROM packages WHERE id=%s", int(u["state"].split(":")[1]))
     if not pack:
-        await state.clear()
-        return await m.answer("Paket topilmadi, qaytadan urinib ko'ring.", reply_markup=main_kb)
-    file_id = m.photo[-1].file_id if m.photo else m.document.file_id
-    row = await q1(
-        "INSERT INTO payments(user_id, coins, price, file_id) VALUES($1,$2,$3,$4) RETURNING *",
-        m.from_user.id, pack["coins"], pack["price"], file_id,
+        set_state(uid, None)
+        return send(uid, "Paket topilmadi, qaytadan urinib ko'ring.", main_kb)
+    file_id = m.photo[-1].file_id if m.content_type == "photo" else m.document.file_id
+    row = q1(
+        "INSERT INTO payments(user_id, coins, price, file_id) VALUES(%s,%s,%s,%s) RETURNING *",
+        uid, pack["coins"], pack["price"], file_id,
     )
-    await state.clear()
-    await m.answer("✅ So'rovingiz adminga yuborildi. Tasdiqlangach tangalar hisobingizga tushadi.", reply_markup=main_kb)
-    u = await get_user(m.from_user.id)
+    set_state(uid, None)
+    send(uid, "✅ So'rovingiz adminga yuborildi. Tasdiqlangach tangalar hisobingizga tushadi.", main_kb)
     for aid in ADMIN_IDS:
         try:
-            if m.photo:
-                await bot.send_photo(aid, file_id, caption=pay_caption(row, u), reply_markup=pay_kb(row["id"]))
-            else:
-                await bot.send_document(aid, file_id, caption=pay_caption(row, u), reply_markup=pay_kb(row["id"]))
+            send_payment_to(aid, row, u)
         except Exception as e:  # noqa: BLE001
             log.warning("admin %s ga yuborib bo'lmadi: %s", aid, e)
 
 
-@dp.message(Pay.screenshot)
-async def pay_wrong(m: Message):
-    await m.answer("Iltimos, chek skrinshotini <b>rasm</b> qilib yuboring yoki bekor qiling.")
-
-
-@dp.callback_query(F.data.startswith("py:"))
-async def pay_decide(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer("Ruxsat yo'q", show_alert=True)
-    _, act, pid = c.data.split(":")
-    ok = act == "ok"
-    row = await q1(
-        "UPDATE payments SET status=$2 WHERE id=$1 AND status='pending' RETURNING *",
-        int(pid), "approved" if ok else "rejected",
-    )
-    if not row:
-        return await c.answer("Bu to'lov allaqachon ko'rib chiqilgan", show_alert=True)
-    if ok:
-        await ex("UPDATE users SET coins=coins+$2 WHERE id=$1", row["user_id"], row["coins"])
-        await safe_send(row["user_id"], f"✅ To'lovingiz tasdiqlandi! Hisobingizga <b>{row['coins']}</b> tanga qo'shildi.")
-    else:
-        await safe_send(row["user_id"], "❌ To'lovingiz rad etildi. Muammo bo'lsa admin bilan bog'laning.")
-    try:
-        await c.message.edit_caption(
-            caption=(c.message.caption or "") + ("\n\n✅ TASDIQLANDI" if ok else "\n\n❌ RAD ETILDI"),
-            reply_markup=None,
-        )
-    except TelegramBadRequest:
-        pass
-    await c.answer("Bajarildi")
-
-
 # ------------------------------------------------------------------ admin panel
-def admin_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for text, data in [
-        ("📊 Statistika", "a:stats"),
-        ("💳 Kutilayotgan to'lovlar", "a:pays"),
-        ("📦 Tanga paketlari", "a:packs"),
-        ("💳 Karta raqami", "a:card"),
-        ("🎁 Tanga berish/ayirish", "a:give"),
-        ("🚫 Ban / Unban", "a:ban"),
-        ("📢 Xabar yuborish", "a:bc"),
-        ("🎁 Boshlang'ich tanga", "a:start"),
-    ]:
-        kb.button(text=text, callback_data=data)
-    kb.adjust(1, 1, 1, 1, 2, 1, 1)
-    return kb.as_markup()
+def admin_menu_kb():
+    return ikb([
+        [("📊 Statistika", "a:stats")],
+        [("💳 Kutilayotgan to'lovlar", "a:pays")],
+        [("📦 Tanga paketlari", "a:packs")],
+        [("💳 Karta raqami", "a:card")],
+        [("🎁 Tanga berish/ayirish", "a:give"), ("🚫 Ban / Unban", "a:ban")],
+        [("📢 Xabar yuborish", "a:bc")],
+        [("🎁 Boshlang'ich tanga", "a:start")],
+    ])
 
 
-def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Admin menyu", callback_data="a:menu")]])
+def open_admin(uid):
+    ex("INSERT INTO users(id) VALUES(%s) ON CONFLICT (id) DO NOTHING", uid)
+    set_state(uid, None)
+    send(uid, "🛠 <b>Admin panel</b>", admin_menu_kb())
 
 
-@dp.message(Command("admin"))
-async def admin_cmd(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-    await state.clear()
-    await m.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
+@bot.message_handler(commands=["admin"], chat_types=["private"])
+def cmd_admin(m):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        return send(
+            uid,
+            f"⛔ Siz admin emassiz.\nSizning Telegram ID: <code>{uid}</code>\n\n"
+            "Admin bo'lish uchun shu raqamni Render → Environment → <code>ADMIN_IDS</code> ga yozing.",
+        )
+    open_admin(uid)
 
 
-@dp.callback_query(F.data.startswith("a:"))
-async def admin_cb(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer("Ruxsat yo'q", show_alert=True)
-    act = c.data[2:]
-    await c.answer()
-    await state.clear()
+@bot.message_handler(commands=["id"], chat_types=["private"])
+def cmd_id(m):
+    send(m.from_user.id, f"Sizning Telegram ID: <code>{m.from_user.id}</code>")
 
+
+def state_admin(m, u):
+    uid, st = u["id"], u["state"]
+    if not is_admin(uid):
+        return set_state(uid, None)
+    text = (m.text or "").strip()
+
+    if st == "adm:bc":
+        set_state(uid, None)
+        threading.Thread(target=broadcast, args=(m.chat.id, m.message_id, uid), daemon=True).start()
+        return send(uid, "📢 Yuborish boshlandi, tugagach xabar beraman.")
+
+    if not text:
+        return send(uid, "Matn yuboring.")
+
+    if st == "adm:pack":
+        try:
+            coins, price = (int(x) for x in text.split())
+            assert coins > 0 and price > 0
+        except Exception:  # noqa: BLE001
+            return send(uid, "Format xato. Masalan: <code>10 9000</code>")
+        ex("INSERT INTO packages(coins, price) VALUES(%s,%s)", coins, price)
+        set_state(uid, None)
+        return send(uid, f"✅ Qo'shildi: {coins} tanga — {money(price)} so'm", ikb([BACK]))
+
+    if st == "adm:card":
+        parts = text.split(maxsplit=1)
+        set_setting("card_number", parts[0])
+        set_setting("card_owner", parts[1] if len(parts) > 1 else "")
+        set_state(uid, None)
+        return send(uid, f"✅ Karta yangilandi:\n<code>{esc(parts[0])}</code> {esc(parts[1] if len(parts) > 1 else '')}", ikb([BACK]))
+
+    if st == "adm:give":
+        try:
+            tid, amount = (int(x) for x in text.split())
+        except Exception:  # noqa: BLE001
+            return send(uid, "Format xato. Masalan: <code>123456789 10</code>")
+        t = get_user(tid)
+        if not t:
+            return send(uid, "Bunday foydalanuvchi topilmadi.")
+        ex("UPDATE users SET coins=GREATEST(coins+%s,0) WHERE id=%s", amount, tid)
+        set_state(uid, None)
+        if amount > 0:
+            send(tid, f"🎁 Hisobingizga <b>{amount}</b> tanga qo'shildi.")
+        return send(uid, f"✅ Bajarildi. {esc(t['name'])} balansi: {qv('SELECT coins FROM users WHERE id=%s', tid)}", ikb([BACK]))
+
+    if st == "adm:ban":
+        if not text.isdigit():
+            return send(uid, "Faqat raqamli user_id yuboring.")
+        tid = int(text)
+        t = get_user(tid)
+        if not t:
+            return send(uid, "Bunday foydalanuvchi topilmadi.")
+        banned = not t["banned"]
+        ex("UPDATE users SET banned=%s, searching=false WHERE id=%s", banned, tid)
+        if banned:
+            pid = end_chat(tid)
+            if pid:
+                send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
+        set_state(uid, None)
+        return send(uid, ("🚫 Banlandi" if banned else "✅ Ban olib tashlandi") + f": {esc(t['name'])} ({tid})", ikb([BACK]))
+
+    if st == "adm:start":
+        if not text.isdigit():
+            return send(uid, "Raqam yuboring.")
+        set_setting("start_coins", text)
+        set_state(uid, None)
+        return send(uid, f"✅ Boshlang'ich tanga: {text}", ikb([BACK]))
+
+
+def broadcast(chat_id, message_id, admin_id):
+    ids = [r["id"] for r in q("SELECT id FROM users WHERE registered AND NOT banned")]
+    ok = 0
+    for tid in ids:
+        try:
+            bot.copy_message(tid, chat_id, message_id)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.05)
+    send(admin_id, f"✅ Yuborildi: {ok}/{len(ids)}", ikb([BACK]))
+
+
+def admin_action(c, act):
+    uid = c.from_user.id
     if act == "menu":
-        return await c.message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
+        return send(uid, "🛠 <b>Admin panel</b>", admin_menu_kb())
 
     if act == "stats":
-        r = await q1(
-            """SELECT count(*) total, count(*) FILTER (WHERE registered) reg,
-               count(*) FILTER (WHERE searching) srch, count(*) FILTER (WHERE partner_id IS NOT NULL) chat,
-               count(*) FILTER (WHERE banned) banned, coalesce(sum(coins),0) coins FROM users"""
+        r = q1(
+            """SELECT count(*) AS total, count(*) FILTER (WHERE registered) AS reg,
+               count(*) FILTER (WHERE searching) AS srch, count(*) FILTER (WHERE partner_id IS NOT NULL) AS chat,
+               count(*) FILTER (WHERE banned) AS banned, coalesce(sum(coins),0) AS coins FROM users"""
         )
-        pend = await qv("SELECT count(*) FROM payments WHERE status='pending'")
-        s = await q1("SELECT count(*) n, coalesce(sum(price),0) s FROM payments WHERE status='approved'")
-        return await c.message.answer(
+        pend = qv("SELECT count(*) FROM payments WHERE status='pending'")
+        s = q1("SELECT count(*) AS n, coalesce(sum(price),0) AS s FROM payments WHERE status='approved'")
+        return send(
+            uid,
             f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: {r['total']} (ro'yxatdan o'tgan: {r['reg']})\n"
             f"🔎 Qidiruvda: {r['srch']}\n💬 Suhbatda: {r['chat']} kishi\n🚫 Banlangan: {r['banned']}\n"
             f"🪙 Jami tangalar (foydalanuvchilarda): {r['coins']}\n\n"
             f"⏳ Kutilayotgan to'lovlar: {pend}\n✅ Tasdiqlangan: {s['n']} ta, {money(s['s'])} so'm",
-            reply_markup=back_kb(),
+            ikb([BACK]),
         )
 
     if act == "pays":
-        rows = await q("SELECT * FROM payments WHERE status='pending' ORDER BY id LIMIT 10")
+        rows = q("SELECT * FROM payments WHERE status='pending' ORDER BY id LIMIT 10")
         if not rows:
-            return await c.message.answer("Kutilayotgan to'lovlar yo'q.", reply_markup=back_kb())
+            return send(uid, "Kutilayotgan to'lovlar yo'q.", ikb([BACK]))
         for p in rows:
-            u = await get_user(p["user_id"])
-            try:
-                await bot.send_photo(c.from_user.id, p["file_id"], caption=pay_caption(p, u), reply_markup=pay_kb(p["id"]))
-            except TelegramBadRequest:
-                await bot.send_document(c.from_user.id, p["file_id"], caption=pay_caption(p, u), reply_markup=pay_kb(p["id"]))
-        return await c.message.answer("⬆️ Oxirgi 10 ta kutilayotgan to'lov", reply_markup=back_kb())
+            send_payment_to(uid, p, get_user(p["user_id"]))
+        return send(uid, "⬆️ Oxirgi 10 ta kutilayotgan to'lov", ikb([BACK]))
 
     if act == "packs":
-        packs = await q("SELECT * FROM packages ORDER BY coins")
-        kb = InlineKeyboardBuilder()
-        for p in packs:
-            kb.button(text=f"🗑 {p['coins']} tanga — {money(p['price'])} so'm", callback_data=f"pd:{p['id']}")
-        kb.button(text="➕ Paket qo'shish", callback_data="a:addpack")
-        kb.button(text="⬅️ Admin menyu", callback_data="a:menu")
-        kb.adjust(1)
-        return await c.message.answer("📦 <b>Paketlar</b> (o'chirish uchun bosing):", reply_markup=kb.as_markup())
+        packs = q("SELECT * FROM packages ORDER BY coins")
+        rows = [[(f"🗑 {p['coins']} tanga — {money(p['price'])} so'm", f"pd:{p['id']}")] for p in packs]
+        rows += [[("➕ Paket qo'shish", "a:addpack")], BACK]
+        return send(uid, "📦 <b>Paketlar</b> (o'chirish uchun bosing):", ikb(rows))
 
-    if act == "addpack":
-        await state.set_state(Adm.pack)
-        return await c.message.answer("Yangi paket: <code>tanga narx</code> ko'rinishida yuboring.\nMasalan: <code>10 9000</code>")
-
-    if act == "card":
-        await state.set_state(Adm.card)
-        return await c.message.answer(
-            "Yangi karta: <code>karta_raqami Ism Familiya</code>\nMasalan: <code>8600123412341234 Ali Valiyev</code>"
-        )
-
-    if act == "give":
-        await state.set_state(Adm.give)
-        return await c.message.answer(
-            "<code>user_id tanga</code> yuboring. Ayirish uchun minus.\nMasalan: <code>123456789 10</code> yoki <code>123456789 -5</code>"
-        )
-
-    if act == "ban":
-        await state.set_state(Adm.ban)
-        return await c.message.answer("Ban/Unban qilinadigan <code>user_id</code> ni yuboring (holati almashadi).")
-
-    if act == "bc":
-        await state.set_state(Adm.broadcast)
-        return await c.message.answer("Hammaga yuboriladigan xabarni yuboring (matn, rasm, video — istalgani).")
-
-    if act == "start":
-        cur = await get_setting("start_coins")
-        await state.set_state(Adm.start_coins)
-        return await c.message.answer(f"Yangi foydalanuvchiga beriladigan tanga soni (hozir: {cur}). Raqam yuboring.")
+    prompts = {
+        "addpack": ("adm:pack", "Yangi paket: <code>tanga narx</code> ko'rinishida yuboring.\nMasalan: <code>10 9000</code>"),
+        "card": ("adm:card", "Yangi karta: <code>karta_raqami Ism Familiya</code>\nMasalan: <code>8600123412341234 Ali Valiyev</code>"),
+        "give": ("adm:give", "<code>user_id tanga</code> yuboring. Ayirish uchun minus.\nMasalan: <code>123456789 10</code> yoki <code>123456789 -5</code>"),
+        "ban": ("adm:ban", "Ban/Unban qilinadigan <code>user_id</code> ni yuboring (holati almashadi)."),
+        "bc": ("adm:bc", "Hammaga yuboriladigan xabarni yuboring (matn, rasm, video — istalgani)."),
+        "start": ("adm:start", f"Yangi foydalanuvchiga beriladigan tanga soni (hozir: {get_setting('start_coins')}). Raqam yuboring."),
+    }
+    if act in prompts:
+        st, text = prompts[act]
+        set_state(uid, st)
+        return send(uid, text)
 
 
-@dp.callback_query(F.data.startswith("pd:"))
-async def pack_delete(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer("Ruxsat yo'q", show_alert=True)
-    await ex("DELETE FROM packages WHERE id=$1", int(c.data[3:]))
-    await c.answer("O'chirildi")
-    await c.message.edit_text("🗑 Paket o'chirildi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Paketlar", callback_data="a:packs")],
-        [InlineKeyboardButton(text="⬅️ Admin menyu", callback_data="a:menu")],
-    ]))
-
-
-@dp.message(Adm.pack, F.text)
-async def adm_pack(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
+# ------------------------------------------------------------------ callbacks
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(c):
+    uid = c.from_user.id
+    data = c.data or ""
+    answer = None
     try:
-        coins, price = (int(x) for x in m.text.split())
-        assert coins > 0 and price > 0
+        if is_admin(uid):
+            ex("INSERT INTO users(id) VALUES(%s) ON CONFLICT (id) DO NOTHING", uid)
+        u = get_user(uid)
+        if not u or (u["banned"] and not is_admin(uid)):
+            answer = ("Ruxsat yo'q", True)
+
+        elif data.startswith("g:") and u["state"] == "gender":
+            tmp = json.loads(u["tmp"] or "{}")
+            tmp["gender"] = data[2:]
+            set_state(uid, "region", tmp)
+            bot.edit_message_text("<b>Viloyatingizni tanlang:</b>", uid, c.message.message_id, reply_markup=region_kb())
+
+        elif data.startswith("r:") and u["state"] == "region":
+            tmp = json.loads(u["tmp"] or "{}")
+            start_coins = int(get_setting("start_coins") or 0)
+            ex(
+                """UPDATE users SET name=%s, age=%s, gender=%s, region=%s, coins=coins+%s,
+                   registered=true, state=NULL, tmp=NULL WHERE id=%s AND NOT registered""",
+                tmp.get("name"), tmp.get("age"), tmp.get("gender"), REGIONS[int(data[2:])], start_coins, uid,
+            )
+            try:
+                bot.delete_message(uid, c.message.message_id)
+            except ApiTelegramException:
+                pass
+            send(
+                uid,
+                f"✅ Ro'yxatdan o'tdingiz!\n🎁 Sizga <b>{start_coins}</b> ta tanga sovg'a qilindi." if start_coins else "✅ Ro'yxatdan o'tdingiz!",
+                main_kb,
+            )
+
+        elif data.startswith("pk:") and u["registered"]:
+            p = q1("SELECT * FROM packages WHERE id=%s", int(data[3:]))
+            if not p:
+                answer = ("Paket topilmadi", True)
+            else:
+                set_state(uid, f"pay:{p['id']}")
+                send(
+                    uid,
+                    f"💳 <b>To'lov ma'lumotlari</b>\n\nPaket: <b>{p['coins']} tanga</b>\n"
+                    f"Summa: <b>{money(p['price'])} so'm</b>\n\nKarta: <code>{esc(get_setting('card_number'))}</code>\n"
+                    f"Egasi: {esc(get_setting('card_owner'))}\n\n"
+                    "To'lovni amalga oshirib, <b>chek skrinshotini</b> shu yerga rasm qilib yuboring.",
+                    cancel_kb,
+                )
+
+        elif data.startswith("py:"):
+            if not is_admin(uid):
+                answer = ("Ruxsat yo'q", True)
+            else:
+                _, act, pid = data.split(":")
+                ok = act == "ok"
+                with db() as cur:
+                    cur.execute(
+                        "UPDATE payments SET status=%s WHERE id=%s AND status='pending' RETURNING *",
+                        ("approved" if ok else "rejected", int(pid)),
+                    )
+                    row = cur.fetchone()
+                    if row and ok:
+                        cur.execute("UPDATE users SET coins=coins+%s WHERE id=%s", (row["coins"], row["user_id"]))
+                if not row:
+                    answer = ("Bu to'lov allaqachon ko'rib chiqilgan", True)
+                else:
+                    if ok:
+                        send(row["user_id"], f"✅ To'lovingiz tasdiqlandi! Hisobingizga <b>{row['coins']}</b> tanga qo'shildi.")
+                    else:
+                        send(row["user_id"], "❌ To'lovingiz rad etildi. Muammo bo'lsa admin bilan bog'laning.")
+                    try:
+                        bot.edit_message_caption(
+                            (getattr(c.message, "html_caption", None) or "") + ("\n\n✅ TASDIQLANDI" if ok else "\n\n❌ RAD ETILDI"),
+                            uid, c.message.message_id, reply_markup=None,
+                        )
+                    except ApiTelegramException:
+                        pass
+                    answer = ("Bajarildi", False)
+
+        elif data.startswith("pd:"):
+            if not is_admin(uid):
+                answer = ("Ruxsat yo'q", True)
+            else:
+                ex("DELETE FROM packages WHERE id=%s", int(data[3:]))
+                bot.edit_message_text(
+                    "🗑 Paket o'chirildi.", uid, c.message.message_id,
+                    reply_markup=ikb([[("📦 Paketlar", "a:packs")], BACK]),
+                )
+
+        elif data.startswith("a:"):
+            if not is_admin(uid):
+                answer = ("Ruxsat yo'q", True)
+            else:
+                set_state(uid, None)
+                admin_action(c, data[2:])
     except Exception:  # noqa: BLE001
-        return await m.answer("Format xato. Masalan: <code>10 9000</code>")
-    await ex("INSERT INTO packages(coins, price) VALUES($1,$2)", coins, price)
-    await state.clear()
-    await m.answer(f"✅ Qo'shildi: {coins} tanga — {money(price)} so'm", reply_markup=back_kb())
-
-
-@dp.message(Adm.card, F.text)
-async def adm_card(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-    parts = m.text.strip().split(maxsplit=1)
-    number = parts[0]
-    owner = parts[1] if len(parts) > 1 else ""
-    await set_setting("card_number", number)
-    await set_setting("card_owner", owner)
-    await state.clear()
-    await m.answer(f"✅ Karta yangilandi:\n<code>{esc(number)}</code> {esc(owner)}", reply_markup=back_kb())
-
-
-@dp.message(Adm.give, F.text)
-async def adm_give(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
+        log.exception("callback xatosi: %s", data)
     try:
-        uid, amount = (int(x) for x in m.text.split())
+        bot.answer_callback_query(c.id, text=answer[0] if answer else None, show_alert=bool(answer and answer[1]))
+    except ApiTelegramException:
+        pass
+
+
+# ------------------------------------------------------------------ asosiy router
+@bot.message_handler(func=lambda m: True, content_types=ALL_TYPES, chat_types=["private"])
+def route(m):
+    uid = m.from_user.id
+    u = get_user(uid)
+    if not u:
+        return send(uid, "Boshlash uchun /start bosing.")
+    if u["banned"] and not is_admin(uid):
+        return send(uid, "🚫 Siz bloklangansiz.")
+    text = (m.text or "").strip()
+    st = u["state"]
+
+    if u["registered"]:
+        buttons = {
+            B_CANCEL: do_cancel, B_STOP: do_stop, B_NEXT: do_next,
+            B_SEARCH: do_search, B_TOPUP: do_topup, B_PROFILE: do_profile,
+        }
+        if text in buttons:
+            if st:
+                set_state(uid, None)
+            return buttons[text](u)
+
+    if st and st.startswith("adm:") and is_admin(uid):
+        return state_admin(m, u)
+
+    if st == "name" and not u["registered"]:
+        return state_name(u, text)
+    if st == "age" and not u["registered"]:
+        return state_age(u, text)
+    if st in ("gender", "region") and not u["registered"]:
+        return send(uid, "Iltimos, yuqoridagi tugmalardan birini tanlang.")
+    if not u["registered"]:
+        return send(uid, "Boshlash uchun /start bosing.")
+
+    if st and st.startswith("pay:"):
+        return state_pay(m, u)
+    if st and st.startswith("adm:"):
+        return state_admin(m, u)
+
+    if u["partner_id"]:
+        return relay(m, u)
+    if u["searching"]:
+        return send(uid, "🔎 Suhbatdosh qidirilmoqda... Kuting yoki bekor qiling.", cancel_kb)
+    send(uid, "Bosh menyu 👇", main_kb)
+
+
+# ------------------------------------------------------------------ web server / ishga tushirish
+app = Flask(__name__)
+
+
+@app.get("/")
+def health():
+    return "ok"
+
+
+@app.post("/webhook")
+def webhook():
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
+        abort(403)
+    try:
+        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+        bot.process_new_updates([update])
     except Exception:  # noqa: BLE001
-        return await m.answer("Format xato. Masalan: <code>123456789 10</code>")
-    u = await get_user(uid)
-    if not u:
-        return await m.answer("Bunday foydalanuvchi topilmadi.")
-    await ex("UPDATE users SET coins=GREATEST(coins+$2,0) WHERE id=$1", uid, amount)
-    await state.clear()
-    new = await qv("SELECT coins FROM users WHERE id=$1", uid)
-    if amount > 0:
-        await safe_send(uid, f"🎁 Hisobingizga <b>{amount}</b> tanga qo'shildi.")
-    await m.answer(f"✅ Bajarildi. {esc(u['name'])} balansi: {new}", reply_markup=back_kb())
+        log.exception("update ishlov berishda xato")
+    return "", 200
 
 
-@dp.message(Adm.ban, F.text)
-async def adm_ban(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-    if not m.text.strip().lstrip("-").isdigit():
-        return await m.answer("Faqat raqamli user_id yuboring.")
-    uid = int(m.text.strip())
-    u = await get_user(uid)
-    if not u:
-        return await m.answer("Bunday foydalanuvchi topilmadi.")
-    banned = not u["banned"]
-    await ex("UPDATE users SET banned=$2, searching=false WHERE id=$1", uid, banned)
-    if banned:
-        pid = await end_chat(uid)
-        if pid:
-            await safe_send(pid, "⚠️ Suhbatdosh suhbatni tugatdi.", main_kb)
-    await state.clear()
-    await m.answer(("🚫 Banlandi" if banned else "✅ Ban olib tashlandi") + f": {esc(u['name'])} ({uid})", reply_markup=back_kb())
-
-
-@dp.message(Adm.start_coins, F.text)
-async def adm_start_coins(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-    if not m.text.strip().isdigit():
-        return await m.answer("Raqam yuboring.")
-    await set_setting("start_coins", m.text.strip())
-    await state.clear()
-    await m.answer(f"✅ Boshlang'ich tanga: {m.text.strip()}", reply_markup=back_kb())
-
-
-@dp.message(Adm.broadcast)
-async def adm_broadcast(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-    await state.clear()
-    ids = [r["id"] for r in await q("SELECT id FROM users WHERE registered AND NOT banned")]
-    await m.answer(f"📢 {len(ids)} ta foydalanuvchiga yuborilmoqda...")
-    ok = 0
-    for uid in ids:
+def keep_alive():
+    """Render bepul rejasida uyquga ketmaslik uchun o'z URL'ini har 9 daqiqada chaqiradi."""
+    time.sleep(60)
+    while True:
         try:
-            await m.copy_to(uid)
-            ok += 1
-        except Exception:  # noqa: BLE001
-            pass
-        await asyncio.sleep(0.05)
-    await m.answer(f"✅ Yuborildi: {ok}/{len(ids)}", reply_markup=back_kb())
+            r = requests.get(f"{BASE_URL}/", timeout=20)
+            log.info("keep-alive: %s", r.status_code)
+        except Exception as e:  # noqa: BLE001
+            log.warning("keep-alive xato: %s", e)
+        time.sleep(540)
 
 
-# ------------------------------------------------------------------ relay (eng oxirida)
-@dp.message(F.chat.type == "private")
-async def relay(m: Message, state: FSMContext):
-    if await state.get_state():
-        return
-    u = await get_user(m.from_user.id)
-    if not u or not u["registered"]:
-        return await m.answer("Boshlash uchun /start bosing.")
-    if not u["partner_id"]:
-        return await m.answer("Bosh menyu 👇", reply_markup=main_kb)
-    try:
-        await m.copy_to(u["partner_id"])
-    except TelegramForbiddenError:
-        await end_chat(m.from_user.id)
-        await m.answer("⚠️ Suhbatdosh botni tark etgan. Suhbat tugatildi.", reply_markup=main_kb)
-    except TelegramBadRequest:
-        await m.answer("Bu xabarni yuborib bo'lmadi.")
-
-
-# ------------------------------------------------------------------ run
-async def on_startup(bot: Bot):
-    await init_db()
-    if BASE_URL:
-        await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=SECRET, drop_pending_updates=True)
-        log.info("Webhook: %s/webhook", BASE_URL)
-
-
-async def on_shutdown(bot: Bot):
-    if pool:
-        await pool.close()
-
-
-async def health(_):
-    return web.Response(text="ok")
-
-
-def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    if BASE_URL:  # Render: webhook rejimi
-        from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-        app = web.Application()
-        app.router.add_get("/", health)
-        SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=SECRET).register(app, path="/webhook")
-        setup_application(app, dp, bot=bot)
-        web.run_app(app, host="0.0.0.0", port=PORT)
-    else:  # lokal: polling
-        async def run():
-            await bot.delete_webhook(drop_pending_updates=True)
-            await dp.start_polling(bot)
-
-        asyncio.run(run())
-
+init_db()
+if BASE_URL:
+    bot.remove_webhook()
+    bot.set_webhook(url=f"{BASE_URL}/webhook", secret_token=SECRET, drop_pending_updates=True)
+    log.info("Webhook: %s/webhook", BASE_URL)
+    threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
-    main()
+    if BASE_URL:  # `python main.py` bilan Render'da ishga tushirilsa ham ishlaydi
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+    else:  # lokal: polling
+        bot.remove_webhook()
+        bot.infinity_polling(skip_pending=True)
