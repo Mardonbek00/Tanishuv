@@ -43,6 +43,16 @@ B_NEXT = "⏭ Next"
 B_STOP = "⛔ Stop"
 B_CANCEL = "❌ Bekor qilish"
 B_ADMIN = "🛠 Admin panel"
+B_BACK = "⬅️ Orqaga"
+B_SKIP = "⏭ O'tkazib yuborish"
+B_E_NAME = "✏️ Ism"
+B_E_AGE = "✏️ Yosh"
+B_E_GENDER = "✏️ Jins"
+B_E_REGION = "✏️ Viloyat"
+B_E_PHOTO = "📸 Rasm yuklash"
+B_E_PHOTO2 = "📸 Rasmni almashtirish"
+B_E_DEL = "🗑 Rasmni o'chirish"
+GENDER_BY_LABEL = {v: k for k, v in GENDERS.items()}
 
 ALL_TYPES = [
     "text", "photo", "video", "audio", "voice", "document", "sticker",
@@ -69,6 +79,37 @@ main_kb = rkb([B_SEARCH], [B_TOPUP, B_PROFILE])
 admin_main_kb = rkb([B_SEARCH], [B_TOPUP, B_PROFILE], [B_ADMIN])
 chat_kb = rkb([B_NEXT, B_STOP])
 cancel_kb = rkb([B_CANCEL])
+back_rkb = rkb([B_BACK])
+skip_kb = rkb([B_SKIP])
+
+
+def gender_kb(back=False):
+    rows = [list(GENDERS.values())]
+    if back:
+        rows.append([B_BACK])
+    return rkb(*rows)
+
+
+def region_kb(back=False):
+    rows, row = [], []
+    for r in REGIONS:
+        row.append(r)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if back:
+        rows.append([B_BACK])
+    return rkb(*rows)
+
+
+def profile_kb(u):
+    rows = [[B_E_NAME, B_E_AGE], [B_E_GENDER, B_E_REGION], [B_E_PHOTO2 if u["photo"] else B_E_PHOTO]]
+    if u["photo"]:
+        rows.append([B_E_DEL])
+    rows.append([B_BACK])
+    return rkb(*rows)
 BACK = [("⬅️ Admin menyu", "a:menu")]
 
 # ------------------------------------------------------------------ database
@@ -237,19 +278,47 @@ def state_age(u, text):
     tmp = json.loads(u["tmp"] or "{}")
     tmp["age"] = int(text)
     set_state(u["id"], "gender", tmp)
-    send(u["id"], "<b>Jinsingiz?</b>", ikb([[(v, f"g:{k}") for k, v in GENDERS.items()]]))
+    send(u["id"], "<b>Jinsingiz?</b>", gender_kb())
 
 
-def region_kb(prefix="r"):
-    rows, row = [], []
-    for i, r in enumerate(REGIONS):
-        row.append((r, f"{prefix}:{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return ikb(rows)
+def state_gender(u, text):
+    if text not in GENDER_BY_LABEL:
+        return send(u["id"], "Iltimos, pastdagi tugmalardan birini tanlang.", gender_kb())
+    tmp = json.loads(u["tmp"] or "{}")
+    tmp["gender"] = GENDER_BY_LABEL[text]
+    set_state(u["id"], "region", tmp)
+    send(u["id"], "<b>Viloyatingizni tanlang:</b>", region_kb())
+
+
+def state_region(u, text):
+    uid = u["id"]
+    if text not in REGIONS:
+        return send(uid, "Iltimos, pastdagi tugmalardan birini tanlang.", region_kb())
+    tmp = json.loads(u["tmp"] or "{}")
+    start_coins = int(get_setting("start_coins") or 0)
+    ex(
+        """UPDATE users SET name=%s, age=%s, gender=%s, region=%s, coins=coins+%s,
+           registered=true, state=NULL, tmp=NULL WHERE id=%s AND NOT registered""",
+        tmp.get("name"), tmp.get("age"), tmp.get("gender"), text, start_coins, uid,
+    )
+    send(
+        uid,
+        f"✅ Ro'yxatdan o'tdingiz!\n🎁 Sizga <b>{start_coins}</b> ta tanga sovg'a qilindi." if start_coins else "✅ Ro'yxatdan o'tdingiz!",
+        main_kb,
+    )
+    set_state(uid, "photo")
+    send(uid, "📸 Profil rasmingizni yuboring (ixtiyoriy).", skip_kb)
+
+
+def state_photo(m, u):
+    uid = u["id"]
+    if m.content_type == "text" and m.text.strip() == B_SKIP:
+        set_state(uid, None)
+        return send(uid, "Bosh menyu 👇", main_kb)
+    if m.content_type != "photo":
+        return send(uid, "Iltimos, oddiy <b>rasm</b> yuboring yoki «O'tkazib yuborish» tugmasini bosing.", skip_kb)
+    ex("UPDATE users SET photo=%s, state=NULL WHERE id=%s", m.photo[-1].file_id, uid)
+    send(uid, "✅ Rasm saqlandi! Bosh menyu 👇", main_kb)
 
 
 # ------------------------------------------------------------------ search / chat
@@ -352,39 +421,82 @@ def do_next(u):
     do_search(get_user(u["id"]))
 
 
+def home(u):
+    """Menyuga qaytish: suhbatda bo'lsa suhbat tugmalari, aks holda bosh menyu."""
+    u = get_user(u["id"])
+    set_state(u["id"], None)
+    if u["partner_id"]:
+        return send(u["id"], "💬 Suhbatga qaytdingiz.", chat_kb)
+    send(u["id"], "Bosh menyu 👇", main_kb)
+
+
 def do_profile(u):
-    rows = [
-        [("✏️ Ism", "e:name"), ("✏️ Yosh", "e:age")],
-        [("✏️ Jins", "e:gender"), ("✏️ Viloyat", "e:region")],
-        [("📸 Rasm yuklash" if not u["photo"] else "📸 Rasmni almashtirish", "e:photo")],
-    ]
-    if u["photo"]:
-        rows.append([("🗑 Rasmni o'chirish", "e:delphoto")])
+    uid = u["id"]
+    set_state(uid, "prof")
     text = (
         f"<b>👤 Profil</b>\n\nIsm: {esc(u['name'])}\nYosh: {u['age']}\n"
-        f"Jins: {GENDERS.get(u['gender'], '-')}\nViloyat: {esc(u['region'])}\n\n💰 Tanga: <b>{u['coins']}</b>"
+        f"Jins: {GENDERS.get(u['gender'], '-')}\nViloyat: {esc(u['region'])}\n\n💰 Tanga: <b>{u['coins']}</b>\n\n"
+        "Tahrirlash uchun pastdagi tugmalardan foydalaning 👇"
     )
-    send_card(u["id"], u, text, ikb(rows)) or send(u["id"], text, ikb(rows))
+    kb = profile_kb(u)
+    if not send_card(uid, u, text, kb):
+        send(uid, text, kb)
 
 
-def state_edit(m, u):
-    """Profilni tahrirlash va ro'yxatdan keyingi ixtiyoriy rasm bosqichi."""
+def state_profile(m, u):
+    """Profil menyusi ("prof") va tahrirlash bosqichlari ("edit:*")."""
     uid, st = u["id"], u["state"]
     text = (m.text or "").strip() if m.content_type == "text" else ""
+
+    if st == "prof":
+        if text == B_BACK:
+            return home(u)
+        if text == B_E_NAME:
+            set_state(uid, "edit:name")
+            return send(uid, "Yangi ismingizni yozing:", back_rkb)
+        if text == B_E_AGE:
+            set_state(uid, "edit:age")
+            return send(uid, f"Yangi yoshingizni yozing ({MIN_AGE}–{MAX_AGE}):", back_rkb)
+        if text == B_E_GENDER:
+            set_state(uid, "edit:gender")
+            return send(uid, "Jinsingizni tanlang:", gender_kb(True))
+        if text == B_E_REGION:
+            set_state(uid, "edit:region")
+            return send(uid, "Viloyatingizni tanlang:", region_kb(True))
+        if text in (B_E_PHOTO, B_E_PHOTO2):
+            set_state(uid, "edit:photo")
+            return send(uid, "📸 Yangi rasmni yuboring:", back_rkb)
+        if text == B_E_DEL:
+            ex("UPDATE users SET photo=NULL WHERE id=%s", uid)
+            send(uid, "🗑 Rasm o'chirildi.")
+            return do_profile(get_user(uid))
+        return send(uid, "Quyidagi tugmalardan birini tanlang 👇", profile_kb(u))
+
+    if text == B_BACK:  # tahrirlashdan profil menyusiga
+        return do_profile(u)
+
     if st == "edit:name":
         if len(text) < 2:
-            return send(uid, "Ism kamida 2 ta belgidan iborat bo'lsin.")
-        ex("UPDATE users SET name=%s, state=NULL WHERE id=%s", text[:30], uid)
+            return send(uid, "Ism kamida 2 ta belgidan iborat bo'lsin.", back_rkb)
+        ex("UPDATE users SET name=%s WHERE id=%s", text[:30], uid)
     elif st == "edit:age":
         if not text.isdigit() or not (MIN_AGE <= int(text) <= MAX_AGE):
-            return send(uid, f"Yoshni {MIN_AGE}–{MAX_AGE} oralig'ida raqam bilan kiriting.")
-        ex("UPDATE users SET age=%s, state=NULL WHERE id=%s", int(text), uid)
-    else:  # "photo" yoki "edit:photo"
+            return send(uid, f"Yoshni {MIN_AGE}–{MAX_AGE} oralig'ida raqam bilan kiriting.", back_rkb)
+        ex("UPDATE users SET age=%s WHERE id=%s", int(text), uid)
+    elif st == "edit:gender":
+        if text not in GENDER_BY_LABEL:
+            return send(uid, "Iltimos, pastdagi tugmalardan birini tanlang.", gender_kb(True))
+        ex("UPDATE users SET gender=%s WHERE id=%s", GENDER_BY_LABEL[text], uid)
+    elif st == "edit:region":
+        if text not in REGIONS:
+            return send(uid, "Iltimos, pastdagi tugmalardan birini tanlang.", region_kb(True))
+        ex("UPDATE users SET region=%s WHERE id=%s", text, uid)
+    elif st == "edit:photo":
         if m.content_type != "photo":
-            return send(uid, "Iltimos, oddiy <b>rasm</b> yuboring (fayl emas).")
-        ex("UPDATE users SET photo=%s, state=NULL WHERE id=%s", m.photo[-1].file_id, uid)
-        if st == "photo":
-            return send(uid, "✅ Rasm saqlandi! Bosh menyu 👇", main_kb)
+            return send(uid, "Iltimos, oddiy <b>rasm</b> yuboring (fayl emas).", back_rkb)
+        ex("UPDATE users SET photo=%s WHERE id=%s", m.photo[-1].file_id, uid)
+    else:
+        return home(u)
     send(uid, "✅ Yangilandi.")
     do_profile(get_user(uid))
 
@@ -630,30 +742,6 @@ def on_callback(c):
         if not u or (u["banned"] and not is_admin(uid)):
             answer = ("Ruxsat yo'q", True)
 
-        elif data.startswith("g:") and u["state"] == "gender":
-            tmp = json.loads(u["tmp"] or "{}")
-            tmp["gender"] = data[2:]
-            set_state(uid, "region", tmp)
-            bot.edit_message_text("<b>Viloyatingizni tanlang:</b>", uid, c.message.message_id, reply_markup=region_kb())
-
-        elif data.startswith("r:") and u["state"] == "region":
-            tmp = json.loads(u["tmp"] or "{}")
-            start_coins = int(get_setting("start_coins") or 0)
-            ex(
-                """UPDATE users SET name=%s, age=%s, gender=%s, region=%s, coins=coins+%s,
-                   registered=true, state=NULL, tmp=NULL WHERE id=%s AND NOT registered""",
-                tmp.get("name"), tmp.get("age"), tmp.get("gender"), REGIONS[int(data[2:])], start_coins, uid,
-            )
-            try:
-                bot.delete_message(uid, c.message.message_id)
-            except ApiTelegramException:
-                pass
-            send(
-                uid,
-                f"✅ Ro'yxatdan o'tdingiz!\n🎁 Sizga <b>{start_coins}</b> ta tanga sovg'a qilindi." if start_coins else "✅ Ro'yxatdan o'tdingiz!",
-                main_kb,
-            )
-
         elif data.startswith("pk:") and u["registered"]:
             p = q1("SELECT * FROM packages WHERE id=%s", int(data[3:]))
             if not p:
@@ -740,6 +828,8 @@ def route(m):
             B_CANCEL: do_cancel, B_STOP: do_stop, B_NEXT: do_next,
             B_SEARCH: do_search, B_TOPUP: do_topup, B_PROFILE: do_profile,
         }
+        if is_admin(uid):
+            buttons[B_ADMIN] = lambda _u: open_admin(uid)
         if text in buttons:
             if st:
                 set_state(uid, None)
@@ -748,13 +838,21 @@ def route(m):
     if st and st.startswith("adm:") and is_admin(uid):
         return state_admin(m, u)
 
-    if st == "name" and not u["registered"]:
-        return state_name(u, text)
-    if st == "age" and not u["registered"]:
-        return state_age(u, text)
-    if st in ("gender", "region") and not u["registered"]:
-        return send(uid, "Iltimos, yuqoridagi tugmalardan birini tanlang.")
+    if u["registered"] and st:
+        if st == "photo":
+            return state_photo(m, u)
+        if st == "prof" or st.startswith("edit:"):
+            return state_profile(m, u)
+
     if not u["registered"]:
+        if st == "name":
+            return state_name(u, text)
+        if st == "age":
+            return state_age(u, text)
+        if st == "gender":
+            return state_gender(u, text)
+        if st == "region":
+            return state_region(u, text)
         return send(uid, "Boshlash uchun /start bosing.")
 
     if st and st.startswith("pay:"):
@@ -803,6 +901,10 @@ def keep_alive():
 
 
 init_db()
+if ADMIN_IDS:
+    log.info("Adminlar: %s", sorted(ADMIN_IDS))
+else:
+    log.warning("ADMIN_IDS bo'sh yoki noto'g'ri! Admin panel ochilmaydi. Render → Environment da raqamli ID kiriting.")
 if BASE_URL:
     bot.remove_webhook()
     bot.set_webhook(url=f"{BASE_URL}/webhook", secret_token=SECRET, drop_pending_updates=True)
